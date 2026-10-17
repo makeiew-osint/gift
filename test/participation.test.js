@@ -298,9 +298,25 @@ test("shows winner identities only to admins when a giveaway ends", async () => 
   assert.match(adminResult.text, /Победители:/);
   assert.match(adminResult.text, /tg:\/\/user\?id=(910|911)/);
 
-  const winnerNotices = bot.messages.filter(({ chatId }) => chatId === 910 || chatId === 911);
-  assert.equal(winnerNotices.length, giveaway.winner_count);
-  assert.ok(winnerNotices.every(({ text }) => /Вы выиграли/.test(text)));
+  const participantNotices = bot.messages.filter(({ chatId }) => chatId === 910 || chatId === 911);
+  assert.equal(participantNotices.length, 1);
+  assert.match(participantNotices[0].text, /Приём заявок .* завершён, итоги подведены/);
+  const winnerId = Number(adminResult.text.match(/tg:\/\/user\?id=(\d+)/)[1]);
+  assert.equal(bot.messages.some(({ chatId }) => chatId === winnerId), false);
+});
+
+test("offers admins a close-and-notify button for active giveaways", async () => {
+  const giveaway = createTestGiveaway({ requiredChannels: [] });
+  const bot = new FakeBot();
+  registerAdminHandlers(bot, { adminIds: new Set([900]), botToken: "test-only-bot-token" });
+
+  const ctx = createAdminMessage("/mygiveaways");
+  await bot.commands.get("mygiveaways")(ctx);
+
+  const buttons = ctx.replies[0].options.reply_markup.inline_keyboard.flat();
+  assert.ok(buttons.some(({ text, callback_data }) => (
+    text === "Завершить и уведомить" && callback_data === `finish:${giveaway.id}`
+  )));
 });
 
 test("replaces an unsubscribed winner with the next subscribed candidate", async () => {

@@ -335,21 +335,27 @@ export async function finishGiveaway(bot, adminIds, giveawayId, actorId = null) 
     await sendAdminNotice(bot, adminIds, `Розыгрыш «${giveaway.title}» завершён, но итоги не удалось опубликовать в ${giveaway.publish_channel}. Проверьте права бота.`);
   }
 
-  const winnerNotifications = await Promise.allSettled(
-    giveaway.winners.map((userId) => bot.telegram.sendMessage(
+  const winnersSet = new Set(giveaway.winners);
+  const participants = getGiveawayEntries(giveawayId);
+  const nonWinnerParticipants = participants.filter(({ user_id: userId }) => !winnersSet.has(userId));
+  const participantNotifications = await Promise.allSettled(
+    nonWinnerParticipants.map(({ user_id: userId }) => bot.telegram.sendMessage(
       userId,
-      `Поздравляем! Вы выиграли в розыгрыше «${giveaway.title}».\nПриз: ${giveaway.prize}`,
+      `Приём заявок в розыгрыш «${giveaway.title}» завершён, итоги подведены. Спасибо за участие!`,
     )),
   );
-  winnerNotifications.forEach((result, index) => {
+  participantNotifications.forEach((result, index) => {
     if (result.status === "rejected") {
-      console.error(`Could not notify winner ${giveaway.winners[index]}:`, result.reason);
+      const participant = nonWinnerParticipants[index];
+      console.error(`Could not notify participant ${participant.user_id} about giveaway ${giveawayId}:`, result.reason);
     }
   });
+  const failedParticipantNotifications = participantNotifications
+    .filter((result) => result.status === "rejected").length;
   await sendAdminNotice(
     bot,
     adminIds,
-    `🏆 <b>Итоги розыгрыша «${escapeHtml(giveaway.title)}»</b>\nПриз: ${escapeHtml(giveaway.prize)}\nУчастников: ${giveaway.participantCount}\nИсключено неподписанных: ${giveaway.excludedCount}\n\n<b>Победители:</b>\n${winnerNames}${winnerNotifications.some((result) => result.status === "rejected") ? "\n\nНе всем победителям удалось отправить личное сообщение." : ""}`,
+    `🏆 <b>Итоги розыгрыша «${escapeHtml(giveaway.title)}»</b>\nПриз: ${escapeHtml(giveaway.prize)}\nУчастников: ${giveaway.participantCount}\nИсключено неподписанных: ${giveaway.excludedCount}\n\n<b>Победители:</b>\n${winnerNames}${failedParticipantNotifications ? `\n\nНе удалось уведомить участников (кроме победителей): ${failedParticipantNotifications} из ${participantNotifications.length}.` : ""}`,
     { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
   );
   return true;
@@ -817,7 +823,7 @@ function adminGiveawayKeyboard(giveaway) {
       { text: "Изменить", callback_data: `admin:edit:${giveaway.id}` },
       { text: "Отменить", callback_data: `admin:cancel:${giveaway.id}` },
     ]);
-    rows.push([{ text: "Завершить сейчас", callback_data: `finish:${giveaway.id}` }]);
+    rows.push([{ text: "Завершить и уведомить", callback_data: `finish:${giveaway.id}` }]);
   }
   if (giveaway.status === "cancelled" && getUnrefundedPayments(giveaway.id).length) {
     rows.unshift([{ text: "Проверить / вернуть оплаты", callback_data: `admin:refundlist:${giveaway.id}` }]);
@@ -1547,7 +1553,14 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
     }
     const giveawayId = Number(ctx.match[1]);
     const finished = await finishGiveaway(bot, adminIds, giveawayId, ctx.from.id);
-    await ctx.answerCbQuery(finished ? "Розыгрыш завершён, победители выбраны." : "Розыгрыш уже завершён.");
+    const giveaway = getGiveaway(giveawayId);
+    await ctx.answerCbQuery(
+      finished
+        ? "Розыгрыш завершён, участники уведомлены."
+        : giveaway?.status === "active"
+          ? "Не удалось завершить сейчас. Проверьте уведомление от бота и попробуйте позже."
+          : "Розыгрыш уже завершён.",
+    );
   });
 
   bot.on("text", (ctx) => handleWizardMessage(ctx, adminIds, bot));
