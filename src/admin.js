@@ -705,7 +705,7 @@ async function beginCaptcha(ctx, bot, botToken, giveawayId, onGiveawayDue) {
   );
 }
 
-async function confirmParticipation(ctx, bot, botToken, giveawayId) {
+async function confirmParticipation(ctx, bot, botToken, adminIds, giveawayId) {
   const giveaway = getGiveaway(giveawayId);
   if (!giveaway || giveaway.status !== "active") {
     await editCurrentMessage(ctx, "Этот розыгрыш уже завершён.");
@@ -772,6 +772,12 @@ async function confirmParticipation(ctx, bot, botToken, giveawayId) {
     } catch (error) {
       console.error(`Could not confirm free entry to participant ${ctx.from.id}:`, error);
     }
+    const participantName = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || "Не указано";
+    await sendAdminNotice(
+      bot,
+      adminIds,
+      `✅ Новая бесплатная заявка\nРозыгрыш: «${giveaway.title}» №${giveaway.id}\nУчастник: ${participantName}${ctx.from.username ? ` (@${ctx.from.username})` : ""}\nTelegram ID: ${ctx.from.id}\nПодписки проверены: ${giveaway.required_channels.length ? giveaway.required_channels.join(", ") : "обязательных каналов нет"}\nСтатус: регистрация подтверждена.`,
+    );
   }
   await editCurrentMessage(ctx,
     added ? "Вы в списке участников! Удачи!" : "Вы уже участвуете в этом розыгрыше.",
@@ -1506,7 +1512,7 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
   bot.action(/^confirm:(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     try {
-      await confirmParticipation(ctx, bot, botToken, Number(ctx.match[1]));
+      await confirmParticipation(ctx, bot, botToken, adminIds, Number(ctx.match[1]));
     } catch (error) {
       console.error("Could not register giveaway participant:", error);
       await editCurrentMessage(ctx, "Не удалось зарегистрировать участие. Нажмите кнопку ещё раз.");

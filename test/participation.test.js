@@ -240,10 +240,11 @@ test("runs captcha, rechecks subscriptions, and accepts a Stars payment in Teleg
 test("adds a free participant after the captcha without opening a web app", async () => {
   const token = "test-only-bot-token";
   const userId = 902;
-  const giveaway = createTestGiveaway({ requiredChannels: [], paymentStars: 0 });
+  const giveaway = createTestGiveaway({ requiredChannels: ["@required"], paymentStars: 0 });
   const bot = new FakeBot();
   registerAdminHandlers(bot, { adminIds: new Set([900]), botToken: token });
   let ctx = await invokeAction(bot, `join:${giveaway.id}`, userId);
+  bot.subscribed = true;
   const [left, right] = ctx.lastMessage.text.match(/\d+ \+ \d+/)[0].match(/\d+/g).map(Number);
   const challengeId = ctx.lastMessage.options.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
 
@@ -252,6 +253,19 @@ test("adds a free participant after the captcha without opening a web app", asyn
   ctx = await invokeAction(bot, `confirm:${giveaway.id}`, userId);
   assert.equal(store.hasEntry(giveaway.id, userId), true);
   assert.match(ctx.lastMessage.text, /Вы в списке участников/);
+  const adminNotice = bot.messages.find(({ chatId, text }) => (
+    chatId === 900 && /Новая бесплатная заявка/.test(text)
+  ));
+  assert.ok(adminNotice);
+  assert.match(adminNotice.text, /Участник: Участник \(@participant\)/);
+  assert.match(adminNotice.text, new RegExp(`Telegram ID: ${userId}`));
+  assert.match(adminNotice.text, /Подписки проверены: @required/);
+  assert.match(adminNotice.text, /регистрация подтверждена/i);
+
+  await invokeAction(bot, `confirm:${giveaway.id}`, userId);
+  assert.equal(bot.messages.filter(({ chatId, text }) => (
+    chatId === 900 && /Новая бесплатная заявка/.test(text)
+  )).length, 1);
 });
 
 test("edits photo giveaway captions instead of trying to edit media as text", async () => {
