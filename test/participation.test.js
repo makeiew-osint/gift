@@ -311,12 +311,35 @@ test("shows winner identities only to admins when a giveaway ends", async () => 
   assert.equal(adminResult.extra.parse_mode, "HTML");
   assert.match(adminResult.text, /Победители:/);
   assert.match(adminResult.text, /tg:\/\/user\?id=(910|911)/);
+  assert.match(adminResult.text, /Доставлено: 1 из 1/);
+  assert.match(adminResult.text, /Не доставлено: 0/);
 
   const participantNotices = bot.messages.filter(({ chatId }) => chatId === 910 || chatId === 911);
   assert.equal(participantNotices.length, 1);
   assert.match(participantNotices[0].text, /Приём заявок .* завершён, итоги подведены/);
   const winnerId = Number(adminResult.text.match(/tg:\/\/user\?id=(\d+)/)[1]);
   assert.equal(bot.messages.some(({ chatId }) => chatId === winnerId), false);
+});
+
+test("reports undelivered participant notifications to admins with participant IDs", async () => {
+  const giveaway = createTestGiveaway({ requiredChannels: [] });
+  store.addEntry(giveaway.id, 912, null, { firstName: "Анна", username: "anna" });
+  store.addEntry(giveaway.id, 913, null, { firstName: "Борис", username: "boris" });
+  const bot = new FakeBot();
+  const sendMessage = bot.telegram.sendMessage;
+  bot.telegram.sendMessage = async (chatId, text, extra) => {
+    if (chatId === 912 || chatId === 913) throw new Error("User blocked the bot");
+    return sendMessage(chatId, text, extra);
+  };
+
+  assert.equal(await finishGiveaway(bot, new Set([900]), giveaway.id), true);
+
+  const winnerId = store.getWinners(giveaway.id)[0];
+  const nonWinnerId = [912, 913].find((userId) => userId !== winnerId);
+  const adminReports = bot.messages.filter(({ chatId }) => chatId === 900);
+  assert.ok(adminReports.some(({ text }) => /Доставлено: 0 из 1[\s\S]*Не доставлено: 1/.test(text)));
+  assert.ok(adminReports.some(({ text }) => text.includes(`Telegram ID ${nonWinnerId}`)));
+  assert.ok(adminReports.every(({ text }) => !text.includes(`Telegram ID ${winnerId}`)));
 });
 
 test("offers admins a close-and-notify button for active giveaways", async () => {

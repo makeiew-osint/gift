@@ -352,12 +352,35 @@ export async function finishGiveaway(bot, adminIds, giveawayId, actorId = null) 
   });
   const failedParticipantNotifications = participantNotifications
     .filter((result) => result.status === "rejected").length;
+  const deliveredParticipantNotifications = participantNotifications.length - failedParticipantNotifications;
   await sendAdminNotice(
     bot,
     adminIds,
-    `🏆 <b>Итоги розыгрыша «${escapeHtml(giveaway.title)}»</b>\nПриз: ${escapeHtml(giveaway.prize)}\nУчастников: ${giveaway.participantCount}\nИсключено неподписанных: ${giveaway.excludedCount}\n\n<b>Победители:</b>\n${winnerNames}${failedParticipantNotifications ? `\n\nНе удалось уведомить участников (кроме победителей): ${failedParticipantNotifications} из ${participantNotifications.length}.` : ""}`,
+    `🏆 <b>Итоги розыгрыша «${escapeHtml(giveaway.title)}»</b>\nПриз: ${escapeHtml(giveaway.prize)}\nУчастников: ${giveaway.participantCount}\nИсключено неподписанных: ${giveaway.excludedCount}\n\n<b>Победители:</b>\n${winnerNames}\n\n<b>Уведомления участникам (победителям не отправляли):</b>\nДоставлено: ${deliveredParticipantNotifications} из ${participantNotifications.length}\nНе доставлено: ${failedParticipantNotifications}`,
     { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
   );
+  if (failedParticipantNotifications) {
+    const failedLines = participantNotifications.flatMap((result, index) => {
+      if (result.status !== "rejected") return [];
+      const participant = nonWinnerParticipants[index];
+      const name = [participant.first_name, participant.username ? `@${participant.username}` : null]
+        .filter(Boolean)
+        .join(" ");
+      return [`• ${name || "Участник"} — Telegram ID ${participant.user_id}`];
+    });
+    let reportChunk = `Не удалось доставить уведомление участникам розыгрыша №${giveaway.id}:\n`;
+    const maxChunkLength = 3500;
+    for (const line of failedLines) {
+      if (reportChunk.length + line.length + 1 > maxChunkLength) {
+        await sendAdminNotice(bot, adminIds, reportChunk.trimEnd());
+        reportChunk = `Не удалось доставить уведомление участникам розыгрыша №${giveaway.id} (продолжение):\n`;
+      }
+      reportChunk += `${line}\n`;
+    }
+    if (reportChunk.trimEnd() !== `Не удалось доставить уведомление участникам розыгрыша №${giveaway.id}:`) {
+      await sendAdminNotice(bot, adminIds, reportChunk.trimEnd());
+    }
+  }
   return true;
 }
 
