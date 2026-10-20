@@ -38,6 +38,13 @@ import {
   recordChallengeAttempt,
   saveChallenge,
   saveVerification,
+  isUserBlocked,
+  recordEntryChannelCheck,
+  trackReferralVisit,
+  getReferralReferrer,
+  recordChannelReaction,
+  hasGiveawayReaction,
+  setGiveawayChannelChatId,
 } from "./store.js";
 import { randomInt, randomUUID } from "node:crypto";
 import { createCaptchaQuestion, hashCaptchaAnswer, matchesCaptchaAnswer } from "./telegram.js";
@@ -53,6 +60,7 @@ const wizardSteps = [
   "stars",
   "publishChannel",
   "requiredChannels",
+  "requiredReaction",
   "winnerCount",
   "finishRule",
 ];
@@ -108,6 +116,7 @@ function giveawayText(giveaway) {
     giveaway.required_channels.length
       ? `Подписка обязательна: ${giveaway.required_channels.join(", ")}`
       : "Обязательная подписка на каналы не требуется",
+    giveaway.require_reaction ? "Реакция на объявление обязательна" : "",
     `До конца: ${remainingTime ?? "до набора участников"}`,
     giveaway.target_participants
       ? `Участников: ${participantCount} из ${giveaway.target_participants}`
@@ -133,6 +142,9 @@ function giveawayPost(giveaway) {
     "",
     requiredChannels.length
       ? "<i>Подписка на обязательные каналы должна сохраняться до подведения итогов. Перед выбором победителей бот проверит её ещё раз.</i>"
+      : "",
+    giveaway.require_reaction
+      ? "<i>Для участия поставьте любую реакцию на эту публикацию от своего аккаунта. Бот проверит её перед регистрацией и перед выбором победителей.</i>"
       : "",
     "",
     "<i>Нажмите кнопку ниже, чтобы принять участие</i>",
@@ -160,6 +172,7 @@ async function sendGiveawayPreview(ctx, wizard) {
     payment_stars: wizard.paymentStars,
     media_type: wizard.mediaType,
     media_file_id: wizard.mediaFileId,
+    require_reaction: Boolean(wizard.requireReaction),
   };
   pendingPreviews.set(previewId, { userId: ctx.from.id, draft, createdAt: Date.now() });
   await ctx.reply("Проверьте объявление ниже. Оно появится в канале только после вашего подтверждения.");
@@ -226,7 +239,7 @@ export async function publishGiveaway(bot, giveaway) {
   if (!giveaway.media_file_id) {
     const message = await bot.telegram.sendMessage(giveaway.publish_channel, giveawayPost(giveaway), options);
     if (Number.isInteger(message?.message_id)) {
-      savePublishedMessageIds(giveaway.id, message.message_id);
+      savePublishedMessageIds(giveaway.id, message.message_id, null, message.chat?.id ?? null);
     }
     return message;
   }
@@ -240,7 +253,7 @@ export async function publishGiveaway(bot, giveaway) {
       caption: post,
     });
     if (Number.isInteger(message?.message_id)) {
-      savePublishedMessageIds(giveaway.id, message.message_id, message.message_id);
+      savePublishedMessageIds(giveaway.id, message.message_id, message.message_id, message.chat?.id ?? null);
     }
     return message;
   }
@@ -251,6 +264,7 @@ export async function publishGiveaway(bot, giveaway) {
       giveaway.id,
       message.message_id,
       Number.isInteger(mediaMessage?.message_id) ? mediaMessage.message_id : null,
+      message.chat?.id ?? null,
     );
   }
   return message;
@@ -268,13 +282,15 @@ async function sendAdminNotice(bot, adminIds, text, options) {
 }
 
 async function participantStillSubscribed(bot, giveaway, userId) {
+  let allSubscribed = true;
   for (const channel of giveaway.required_channels) {
     const member = await bot.telegram.getChatMember(channel, userId);
     const subscribed = ["creator", "administrator", "member"].includes(member.status)
       || (member.status === "restricted" && member.is_member);
-    if (!subscribed) return false;
+    recordEntryChannelCheck(giveaway.id, userId, channel, "draw", subscribed);
+    if (!subscribed) allSubscribed = false;
   }
-  return true;
+  return allSubscribed && (!giveaway.require_reaction || hasGiveawayReaction(giveaway.id, userId));
 }
 
 export async function finishGiveaway(bot, adminIds, giveawayId, actorId = null) {
@@ -328,7 +344,7 @@ export async function finishGiveaway(bot, adminIds, giveawayId, actorId = null) 
   try {
     await bot.telegram.sendMessage(
       giveaway.publish_channel,
-      `🏆 Розыгрыш «${giveaway.title}» завершён.\nУчастников: ${giveaway.participantCount}\nПобедителей: ${giveaway.winners.length}\nПодписки победителей проверены повторно.\nИтоги отправлены организатору.`,
+      `🏆 Розыгрыш «${giveaway.title}» завершён.\nУчастников: ${giveaway.participantCount}\nПобедителей: ${giveaway.winners.length}\nУсловия подписки и реакции победителей проверены повторно.\nИтоги отправлены организатору.`,
     );
   } catch (error) {
     console.error(`Could not publish results for giveaway ${giveawayId}:`, error);
@@ -356,7 +372,7 @@ export async function finishGiveaway(bot, adminIds, giveawayId, actorId = null) 
   await sendAdminNotice(
     bot,
     adminIds,
-    `🏆 <b>Итоги розыгрыша «${escapeHtml(giveaway.title)}»</b>\nПриз: ${escapeHtml(giveaway.prize)}\nУчастников: ${giveaway.participantCount}\nИсключено неподписанных: ${giveaway.excludedCount}\n\n<b>Победители:</b>\n${winnerNames}\n\n<b>Уведомления участникам (победителям не отправляли):</b>\nДоставлено: ${deliveredParticipantNotifications} из ${participantNotifications.length}\nНе доставлено: ${failedParticipantNotifications}`,
+    `🏆 <b>Итоги розыгрыша «${escapeHtml(giveaway.title)}»</b>\nПриз: ${escapeHtml(giveaway.prize)}\nУчастников: ${giveaway.participantCount}\nИсключено за невыполнение условий: ${giveaway.excludedCount}\n\n<b>Победители:</b>\n${winnerNames}\n\n<b>Уведомления участникам (победителям не отправляли):</b>\nДоставлено: ${deliveredParticipantNotifications} из ${participantNotifications.length}\nНе доставлено: ${failedParticipantNotifications}`,
     { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
   );
   if (failedParticipantNotifications) {
@@ -428,6 +444,7 @@ function askNext(ctx, wizard) {
     stars: "Сколько стоит участие? Отправьте 0 для бесплатного розыгрыша или число Stars, например: 5.",
     publishChannel: "Куда опубликовать объявление? Отправьте публичный канал в формате @channelname. Бот должен быть администратором канала.",
     requiredChannels: "На какие каналы участник должен подписаться? Отправьте названия через пробел или запятую, например: @channel1 @channel2. Если подписка не нужна, отправьте дефис: -",
+    requiredReaction: "Нужна ли реакция на публикации розыгрыша? Отправьте «да» или «нет». Если да, подойдёт любая реакция; бот проверит её при участии и перед выбором победителя.",
     winnerCount: "Сколько победителей выбрать? Отправьте число от 1 до 100.",
     finishRule: "Когда подвести итоги? Отправьте часы и количество участников через пробел.\n\n24 100 — завершить через 24 часа ИЛИ при 100 участниках.\n0.5 - — завершить через 30 минут.\n- 100 — завершить, когда наберётся 100 участников.\n\nЧасы: от 1 минуты до 8760 (можно дробно, например 0.5 = 30 минут). Участники: от 1 до 1 000 000.",
   };
@@ -456,6 +473,7 @@ async function handleWizardMessage(ctx, adminIds, bot) {
     }
     try {
       let patch;
+      let reactionChatId = null;
       switch (wizard.editField) {
         case "title":
           if (text.length > 80) throw new Error("Название должно быть не длиннее 80 символов.");
@@ -473,6 +491,20 @@ async function handleWizardMessage(ctx, adminIds, bot) {
           patch = { required_channels: validateChannels(text, true) };
           await Promise.all(patch.required_channels.map((channel) => ensureBotAdmin(bot, channel)));
           break;
+        case "reaction": {
+          const answer = text.toLocaleLowerCase("ru-RU");
+          if (!["да", "нет"].includes(answer)) throw new Error("Отправьте «да» или «нет».");
+          patch = { require_reaction: answer === "да" };
+          if (patch.require_reaction) {
+            await ensureBotAdmin(bot, current.publish_channel);
+            const channel = await bot.telegram.getChat(current.publish_channel);
+            if (!Number.isSafeInteger(channel.id)) {
+              throw new Error("Telegram не вернул ID канала. Не удалось включить проверку реакции.");
+            }
+            reactionChatId = channel.id;
+          }
+          break;
+        }
         case "hours": {
           const hours = Number(text);
           const durationMs = Math.round(hours * 60) * 60_000;
@@ -520,6 +552,7 @@ async function handleWizardMessage(ctx, adminIds, bot) {
       if (!updateGiveaway(current.id, patch, ctx.from.id)) {
         throw new Error("Не удалось сохранить изменения: розыгрыш уже не активен.");
       }
+      if (reactionChatId !== null) setGiveawayChannelChatId(current.id, reactionChatId);
       wizardByUser.delete(ctx.from.id);
       await sendAdminNotice(bot, adminIds, `Администратор ${ctx.from.id} изменил розыгрыш №${current.id}: ${Object.keys(patch).join(", ")}.`);
       return ctx.reply(`Розыгрыш №${current.id} обновлён. Объявление в канале также обновлено.${current.channel_message_id ? "" : "\nДля старой публикации отправлена новая карточка."}`);
@@ -582,8 +615,15 @@ async function handleWizardMessage(ctx, adminIds, bot) {
         break;
       case "requiredChannels":
         wizard.requiredChannels = validateChannels(text, true);
+        wizard.step = "requiredReaction";
+        break;
+      case "requiredReaction": {
+        const answer = text.toLocaleLowerCase("ru-RU");
+        if (!["да", "нет"].includes(answer)) throw new Error("Отправьте «да» или «нет».");
+        wizard.requireReaction = answer === "да";
         wizard.step = "winnerCount";
         break;
+      }
       case "winnerCount": {
         const count = Number(text);
         if (!Number.isInteger(count) || count < 1 || count > 100) {
@@ -627,6 +667,13 @@ async function getMissingChannels(bot, giveaway, userId) {
   return statuses.filter(Boolean);
 }
 
+function giveawayPostUrl(giveaway) {
+  if (!/^@[A-Za-z0-9_]{5,32}$/.test(giveaway.publish_channel)) return null;
+  return giveaway.channel_message_id
+    ? `https://t.me/${giveaway.publish_channel.slice(1)}/${giveaway.channel_message_id}`
+    : `https://t.me/${giveaway.publish_channel.slice(1)}`;
+}
+
 function entryKeyboard(giveaway) {
   return {
     inline_keyboard: [
@@ -668,14 +715,24 @@ async function showGiveaway(ctx, giveaway, edit = false) {
 
 async function showSubscriptionStep(ctx, bot, giveaway, userId) {
   const missing = await getMissingChannels(bot, giveaway, userId);
-  if (missing.length) {
+  const missingReaction = giveaway.require_reaction && !hasGiveawayReaction(giveaway.id, userId);
+  if (missing.length || missingReaction) {
     const keyboard = missing.map((channel) => [{
       text: channel,
       url: `https://t.me/${channel.slice(1)}`,
     }]);
-    keyboard.push([{ text: "Проверить подписку", callback_data: `check:${giveaway.id}` }]);
+    const requirements = [];
+    if (missing.length) {
+      requirements.push(`Подпишитесь на каналы: ${missing.join(", ")}.`);
+    }
+    if (missingReaction) {
+      requirements.push("Поставьте любую реакцию на публикацию от своего аккаунта. Если уже реагировали, снимите реакцию и поставьте её снова.");
+      const postUrl = giveawayPostUrl(giveaway);
+      if (postUrl) keyboard.push([{ text: "Открыть публикацию", url: postUrl }]);
+    }
+    keyboard.push([{ text: "Проверить условия", callback_data: `check:${giveaway.id}` }]);
     return editCurrentMessage(ctx,
-      `<b>Подпишитесь на каналы</b>\n\nЧтобы участвовать в розыгрыше «${escapeHtml(giveaway.title)}», подпишитесь на каналы ниже, затем нажмите «Проверить подписку».`,
+      `<b>${missing.length ? "Подпишитесь на каналы и выполните условия" : "Выполните условие участия"}</b>\n\nДля розыгрыша «${escapeHtml(giveaway.title)}»:\n${requirements.map((item) => `• ${escapeHtml(item)}`).join("\n")}\n\nЗатем нажмите «Проверить условия».`,
       { parse_mode: "HTML", reply_markup: { inline_keyboard: keyboard } },
     );
   }
@@ -729,6 +786,10 @@ async function beginCaptcha(ctx, bot, botToken, giveawayId, onGiveawayDue) {
 }
 
 async function confirmParticipation(ctx, bot, botToken, adminIds, giveawayId) {
+  if (isUserBlocked(ctx.from.id)) {
+    await editCurrentMessage(ctx, "Участие ограничено администратором.");
+    return;
+  }
   const giveaway = getGiveaway(giveawayId);
   if (!giveaway || giveaway.status !== "active") {
     await editCurrentMessage(ctx, "Этот розыгрыш уже завершён.");
@@ -754,7 +815,9 @@ async function confirmParticipation(ctx, bot, botToken, adminIds, giveawayId) {
   }
 
   const missing = await getMissingChannels(bot, giveaway, ctx.from.id);
-  if (missing.length) return showSubscriptionStep(ctx, bot, giveaway, ctx.from.id);
+  if (missing.length || (giveaway.require_reaction && !hasGiveawayReaction(giveaway.id, ctx.from.id))) {
+    return showSubscriptionStep(ctx, bot, giveaway, ctx.from.id);
+  }
 
   if (giveaway.payment_stars) {
     const payload = createPaymentIntent(
@@ -780,17 +843,27 @@ async function confirmParticipation(ctx, bot, botToken, adminIds, giveawayId) {
     return;
   }
 
-  const added = addEntry(giveawayId, ctx.from.id, null, {
+  const added = addEntry(giveawayId, ctx.from.id, null,   {
     firstName: ctx.from.first_name,
     username: ctx.from.username,
     verifiedChannels: giveaway.required_channels.length,
+    verifiedChannelNames: giveaway.required_channels,
+    referrerId: getReferralReferrer(giveawayId, ctx.from.id),
   });
   if (added) {
     try {
       await bot.telegram.sendMessage(
         ctx.from.id,
         `<b>Вы участвуете!</b>\n\nРозыгрыш: ${escapeHtml(giveaway.title)}\nПриз: ${escapeHtml(giveaway.prize)}\n\nБот сообщит результат после завершения.`,
-        { parse_mode: "HTML" },
+        {
+          parse_mode: "HTML",
+          reply_markup: ctx.botInfo?.username ? {
+            inline_keyboard: [[{
+              text: "Пригласить друга",
+              url: `https://t.me/${ctx.botInfo.username}?start=join_${giveaway.id}_r_${ctx.from.id}`,
+            }]],
+          } : undefined,
+        },
       );
     } catch (error) {
       console.error(`Could not confirm free entry to participant ${ctx.from.id}:`, error);
@@ -863,7 +936,7 @@ function adminGiveawayKeyboard(giveaway) {
 function giveawayAdminSummary(giveaway) {
   const stats = getGiveawayStats(giveaway.id);
   const netStars = stats.stars_collected - stats.stars_refunded;
-  return `№${giveaway.id} · ${giveaway.title}\nСтатус: ${giveawayStatus(giveaway.status)}\nУчастников: ${stats.participant_count}\nОплат: ${stats.paid_count} · собрано ${stats.stars_collected} ⭐\nВозвратов: ${stats.refunded_count} · возвращено ${stats.stars_refunded} ⭐\nБаланс розыгрыша: ${netStars} ⭐\nПроверено подписок: ${stats.verified_subscriptions}`;
+  return `№${giveaway.id} · ${giveaway.title}\nСтатус: ${giveawayStatus(giveaway.status)}\nУчастников: ${stats.participant_count}\nОплат: ${stats.paid_count} · собрано ${stats.stars_collected} ⭐\nВозвратов: ${stats.refunded_count} · возвращено ${stats.stars_refunded} ⭐\nБаланс розыгрыша: ${netStars} ⭐\nПроверено подписок: ${stats.verified_subscriptions}\nРеакция на публикацию: ${giveaway.require_reaction ? "обязательна" : "не требуется"}`;
 }
 
 function csvCell(value) {
@@ -972,6 +1045,7 @@ function editFieldsKeyboard(giveawayId) {
       { text: "Лимит участников", callback_data: `admin:field:${giveawayId}:target` },
     ],
     [{ text: "Число победителей", callback_data: `admin:field:${giveawayId}:winners` }],
+    [{ text: "Условие реакции", callback_data: `admin:field:${giveawayId}:reaction` }],
   ] };
 }
 
@@ -1111,12 +1185,17 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
 
   bot.start(async (ctx) => {
     const payload = ctx.startPayload || "";
-    const giveawayId = payload.match(/^join_(\d+)$/)?.[1];
+    const joinPayload = payload.match(/^join_(\d+)(?:_r_(\d+))?$/);
+    const giveawayId = joinPayload?.[1];
     if (giveawayId) {
       const giveaway = getGiveaway(Number(giveawayId));
       if (!giveaway || giveaway.status !== "active") {
         await ctx.reply("Этот розыгрыш уже завершён.");
         return sendWelcome(ctx);
+      }
+      giveaway.referrerId = joinPayload[2] ? Number(joinPayload[2]) : null;
+      if (giveaway.referrerId && giveaway.referrerId !== ctx.from.id) {
+        trackReferralVisit(giveaway.id, giveaway.referrerId, ctx.from.id);
       }
       return showGiveaway(ctx, giveaway);
     }
@@ -1308,7 +1387,7 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
     );
   });
 
-  bot.action(/^admin:field:(\d+):(title|prize|description|channels|hours|target|winners)$/, async (ctx) => {
+  bot.action(/^admin:field:(\d+):(title|prize|description|channels|reaction|hours|target|winners)$/, async (ctx) => {
     if (!isAdmin(ctx, adminIds)) {
       await ctx.answerCbQuery("Только для администратора.", { show_alert: true });
       return;
@@ -1321,6 +1400,7 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
       prize: "Отправьте новое описание приза (до 120 символов).",
       description: "Отправьте новое описание (до 600 символов), либо - чтобы очистить.",
       channels: "Отправьте обязательные каналы через пробел или - если подписка не нужна.",
+      reaction: "Нужна ли реакция на публикации? Отправьте «да» или «нет». Любая реакция подойдёт. При включении участникам нужно будет поставить реакцию заново.",
       hours: "Сколько часов оставить до завершения? Введите число от 0.0167 до 8760; можно дробно, например 0.5 = 30 минут.",
       target: "Введите новый лимит участников или - чтобы убрать лимит.",
       winners: "Введите число победителей от 1 до 100.",
@@ -1594,10 +1674,25 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
 
   bot.on("text", (ctx) => handleWizardMessage(ctx, adminIds, bot));
   bot.on(["photo", "animation"], (ctx) => handleWizardMessage(ctx, adminIds, bot));
+  bot.on("message_reaction", async (ctx) => {
+    const update = ctx.update.message_reaction;
+    const userId = update.user?.id;
+    if (!Number.isSafeInteger(userId)) return;
+    recordChannelReaction(
+      update.chat.id,
+      update.message_id,
+      userId,
+      Array.isArray(update.new_reaction) && update.new_reaction.length > 0,
+    );
+  });
 
   bot.on("pre_checkout_query", async (ctx) => {
     const query = ctx.preCheckoutQuery;
     try {
+      if (isUserBlocked(query.from.id)) {
+        await ctx.answerPreCheckoutQuery(false, "Участие ограничено администратором.");
+        return;
+      }
       const intent = getPaymentIntent(query.invoice_payload);
       const giveaway = intent && getGiveaway(intent.giveaway_id);
       if (
@@ -1613,6 +1708,7 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
         || giveaway.payment_stars !== query.total_amount
         || query.currency !== "XTR"
         || hasEntry(giveaway.id, query.from.id)
+        || isUserBlocked(query.from.id)
       ) {
         await ctx.answerPreCheckoutQuery(false, "Счёт недействителен или розыгрыш уже завершён.");
         return;
@@ -1626,6 +1722,10 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
       }));
       if (missingChannels.some(Boolean)) {
         await ctx.answerPreCheckoutQuery(false, "Перед оплатой подпишитесь на обязательные каналы.");
+        return;
+      }
+      if (giveaway.require_reaction && !hasGiveawayReaction(giveaway.id, query.from.id)) {
+        await ctx.answerPreCheckoutQuery(false, "Поставьте реакцию на публикацию и проверьте условие перед оплатой.");
         return;
       }
       await ctx.answerPreCheckoutQuery(true);
@@ -1656,6 +1756,27 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
       await sendAdminNotice(bot, adminIds, `Получен платёж Stars, который не удалось сопоставить с ожидаемым участием. User ID: ${ctx.from.id}. Проверьте платеж вручную.`);
       return;
     }
+    if (isUserBlocked(ctx.from.id)) {
+      markPaymentIntentPaid(payment.invoice_payload);
+      recordGiveawayEvent(giveaway.id, "payment_received", ctx.from.id, {
+        chargedStars: payment.total_amount,
+        chargeId: payment.telegram_payment_charge_id,
+        source: "blocked-user",
+      });
+      recordGiveawayEvent(giveaway.id, "refund_failed", ctx.from.id, {
+        userId: ctx.from.id,
+        stars: payment.total_amount,
+        chargeId: payment.telegram_payment_charge_id,
+        source: "blocked-user",
+        error: "Payment completed after the participant was added to the blacklist.",
+      });
+      await sendAdminNotice(
+        bot,
+        adminIds,
+        `Платёж ${payment.total_amount} Stars поступил от пользователя из чёрного списка.\nРозыгрыш №${giveaway.id}, user ID: ${ctx.from.id}. Требуется ручная проверка и при необходимости возврат.`,
+      );
+      return;
+    }
     if (giveaway.status !== "active" || giveaway.drawing_started_at || isGiveawayDue(giveaway)) {
       markPaymentIntentPaid(payment.invoice_payload);
       if (giveaway.status === "cancelled") {
@@ -1663,6 +1784,8 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
           firstName: ctx.from.first_name,
           username: ctx.from.username,
           verifiedChannels: giveaway.required_channels.length,
+          verifiedChannelNames: giveaway.required_channels,
+          referrerId: getReferralReferrer(giveaway.id, ctx.from.id),
         });
         if (!added) {
           recordGiveawayEvent(giveaway.id, "payment_received", ctx.from.id, {
@@ -1728,6 +1851,8 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
         firstName: ctx.from.first_name,
         username: ctx.from.username,
         verifiedChannels: giveaway.required_channels.length,
+        verifiedChannelNames: giveaway.required_channels,
+        referrerId: getReferralReferrer(giveaway.id, ctx.from.id),
       },
     );
     markPaymentIntentPaid(payment.invoice_payload);
@@ -1735,7 +1860,14 @@ export function registerAdminHandlers(bot, { adminIds, botToken }) {
       if (!added) {
         await ctx.reply("Оплата получена, но вы уже зарегистрированы в этом розыгрыше.");
       } else {
-        await ctx.reply(`Оплата получена — вы участвуете в розыгрыше «${giveaway.title}»!`);
+        await ctx.reply(`Оплата получена — вы участвуете в розыгрыше «${giveaway.title}»!`, {
+          reply_markup: ctx.botInfo?.username ? {
+            inline_keyboard: [[{
+              text: "Пригласить друга",
+              url: `https://t.me/${ctx.botInfo.username}?start=join_${giveaway.id}_r_${ctx.from.id}`,
+            }]],
+          } : undefined,
+        });
       }
     } catch (error) {
       console.error(`Could not confirm Stars payment to participant ${ctx.from.id}:`, error);

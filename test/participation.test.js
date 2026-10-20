@@ -7,9 +7,10 @@ import { randomUUID } from "node:crypto";
 
 const databasePath = path.join(os.tmpdir(), `makeiew-participation-${randomUUID()}.sqlite`);
 process.env.DATABASE_PATH = databasePath;
-const [{ finishGiveaway, registerAdminHandlers, startGiveawayScheduler }, store] = await Promise.all([
+const [{ finishGiveaway, publishGiveaway, registerAdminHandlers, startGiveawayScheduler }, store, dashboard] = await Promise.all([
   import("../src/admin.js"),
   import("../src/store.js"),
+  import("../src/dashboard.js"),
 ]);
 after(() => {
   store.closeDatabase();
@@ -119,6 +120,37 @@ function createContext(userId, data) {
   };
 }
 
+test("sends one-time login codes directly to admins and authenticates the matching recipient", async (t) => {
+  const adminIds = new Set([900, 901]);
+  const bot = new FakeBot();
+  registerAdminHandlers(bot, { adminIds, botToken: "test-only-bot-token" });
+  const server = dashboard.createDashboardServer({ bot, adminIds });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const requested = await fetch(`${baseUrl}/api/login`, { method: "POST" });
+  assert.equal(requested.status, 201);
+  const login = await requested.json();
+  assert.equal("telegramUrl" in login, false);
+  const delivered = bot.messages.filter(({ chatId }) => adminIds.has(chatId));
+  assert.equal(delivered.length, 2);
+  assert.notEqual(delivered[0].text.match(/\b(\d{6})\b/)?.[1], delivered[1].text.match(/\b(\d{6})\b/)?.[1]);
+  const code = delivered[1].text.match(/\b(\d{6})\b/)?.[1];
+  assert.ok(code, "Telegram response contains the six-digit login code");
+
+  const verified = await fetch(`${baseUrl}/api/login/verify`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ challengeId: login.challengeId, code }),
+  });
+  assert.equal(verified.status, 200);
+  assert.match(verified.headers.get("set-cookie"), /HttpOnly/);
+  const session = await fetch(`${baseUrl}/api/session`, {
+    headers: { cookie: verified.headers.get("set-cookie").split(";")[0] },
+  });
+  assert.deepEqual(await session.json(), { authenticated: true, adminId: 901 });
+});
+
 function createAdminMessage(text, userId = 900) {
   return {
     from: { id: userId, first_name: "Администратор" },
@@ -148,6 +180,7 @@ async function invokeAction(bot, data, userId, { media = false } = {}) {
   assert.ok(registered, `No callback registered for ${data}`);
   const ctx = createContext(userId, data);
   ctx.telegram = bot.telegram;
+  ctx.botInfo = { username: "makeiew_bot" };
   if (media) ctx.callbackQuery.message = { photo: [{ file_id: "test-photo" }] };
   ctx.match = typeof registered.trigger === "string"
     ? []
@@ -237,6 +270,77 @@ test("runs captcha, rechecks subscriptions, and accepts a Stars payment in Teleg
   assert.match(bot.messages.at(-1).text, /Звёзды зачислены на баланс бота/);
 });
 
+test("requires a tracked reaction to join and excludes participants who remove it", async () => {
+  const userId = 904;
+  const giveaway = createTestGiveaway({
+    requiredChannels: [],
+    paymentStars: 0,
+    requireReaction: true,
+  });
+  const channelChatId = -1001234567890;
+  store.savePublishedMessageIds(giveaway.id, 4321, null, channelChatId);
+  const bot = new FakeBot();
+  registerAdminHandlers(bot, { adminIds: new Set([900]), botToken: "test-only-bot-token" });
+
+  let ctx = await invokeAction(bot, `join:${giveaway.id}`, userId);
+  const challengeId = ctx.lastMessage.options.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
+  const [left, right] = ctx.lastMessage.text.match(/\d+ \+ \d+/)[0].match(/\d+/g).map(Number);
+  ctx = await invokeAction(bot, `cap:${challengeId}:${left + right}`, userId);
+  assert.match(ctx.lastMessage.text, /поставьте любую реакцию/i);
+  assert.ok(ctx.lastMessage.options.reply_markup.inline_keyboard.flat().some(({ url }) => (
+    url === `https://t.me/makeiew/4321`
+  )));
+
+  ctx = await invokeAction(bot, `confirm:${giveaway.id}`, userId);
+  assert.equal(store.hasEntry(giveaway.id, userId), false);
+
+  await bot.handlers.get("message_reaction")({
+    update: {
+      message_reaction: {
+        chat: { id: channelChatId },
+        message_id: 4321,
+        user: { id: userId },
+        new_reaction: [{ type: "emoji", emoji: "🔥" }],
+      },
+    },
+  });
+  assert.equal(store.hasGiveawayReaction(giveaway.id, userId), true);
+  ctx = await invokeAction(bot, `check:${giveaway.id}`, userId);
+  assert.match(ctx.lastMessage.text, /Проверка пройдена/);
+  ctx = await invokeAction(bot, `confirm:${giveaway.id}`, userId);
+  assert.equal(store.hasEntry(giveaway.id, userId), true);
+
+  await bot.handlers.get("message_reaction")({
+    update: {
+      message_reaction: {
+        chat: { id: channelChatId },
+        message_id: 4321,
+        user: { id: userId },
+        old_reaction: [{ type: "emoji", emoji: "🔥" }],
+        new_reaction: [],
+      },
+    },
+  });
+  assert.equal(store.hasGiveawayReaction(giveaway.id, userId), false);
+  assert.equal(await finishGiveaway(bot, new Set([900]), giveaway.id), true);
+  assert.deepEqual(store.getWinners(giveaway.id), []);
+});
+
+test("stores the Telegram channel and post IDs used to verify reactions", async () => {
+  const giveaway = createTestGiveaway({ requireReaction: true });
+  const bot = new FakeBot();
+  bot.telegram.sendMessage = async () => ({
+    message_id: 7654,
+    chat: { id: -1007654321 },
+  });
+
+  await publishGiveaway(bot, giveaway);
+
+  const published = store.getGiveaway(giveaway.id);
+  assert.equal(published.channel_message_id, 7654);
+  assert.equal(published.channel_chat_id, -1007654321);
+});
+
 test("adds a free participant after the captcha without opening a web app", async () => {
   const token = "test-only-bot-token";
   const userId = 902;
@@ -266,6 +370,39 @@ test("adds a free participant after the captcha without opening a web app", asyn
   assert.equal(bot.messages.filter(({ chatId, text }) => (
     chatId === 900 && /Новая бесплатная заявка/.test(text)
   )).length, 1);
+});
+
+test("tracks referral conversions and blocks blacklisted users from free entry", async () => {
+  const inviterId = 925;
+  const userId = 926;
+  const blockedUserId = 927;
+  const giveaway = createTestGiveaway({ requiredChannels: [], paymentStars: 0 });
+  const bot = new FakeBot();
+  registerAdminHandlers(bot, { adminIds: new Set([900]), botToken: "test-only-bot-token" });
+
+  const startContext = createContext(userId, "");
+  startContext.startPayload = `join_${giveaway.id}_r_${inviterId}`;
+  await bot.startHandler(startContext);
+  assert.equal(store.getReferralReferrer(giveaway.id, userId), inviterId);
+
+  let ctx = await invokeAction(bot, `join:${giveaway.id}`, userId);
+  const challengeId = ctx.lastMessage.options.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
+  const [left, right] = ctx.lastMessage.text.match(/\d+ \+ \d+/)[0].match(/\d+/g).map(Number);
+  await invokeAction(bot, `cap:${challengeId}:${left + right}`, userId);
+  await invokeAction(bot, `confirm:${giveaway.id}`, userId);
+  assert.equal(store.getDashboardParticipants().find((entry) => entry.user_id === userId).referrer_id, inviterId);
+  assert.equal(store.getDashboardReferrals()[0].joins, 1);
+  const referralButton = bot.messages.find(({ chatId }) => chatId === userId).extra.reply_markup.inline_keyboard[0][0];
+  assert.equal(referralButton.url, `https://t.me/makeiew_bot?start=join_${giveaway.id}_r_${userId}`);
+
+  store.addDashboardBlacklistEntry(blockedUserId, "manual review", 900);
+  ctx = await invokeAction(bot, `join:${giveaway.id}`, blockedUserId);
+  const blockedChallengeId = ctx.lastMessage.options.reply_markup.inline_keyboard[0][0].callback_data.split(":")[1];
+  const [blockedLeft, blockedRight] = ctx.lastMessage.text.match(/\d+ \+ \d+/)[0].match(/\d+/g).map(Number);
+  await invokeAction(bot, `cap:${blockedChallengeId}:${blockedLeft + blockedRight}`, blockedUserId);
+  ctx = await invokeAction(bot, `confirm:${giveaway.id}`, blockedUserId);
+  assert.match(ctx.lastMessage.text, /Участие ограничено/);
+  assert.equal(store.hasEntry(giveaway.id, blockedUserId), false);
 });
 
 test("edits photo giveaway captions instead of trying to edit media as text", async () => {
@@ -370,7 +507,7 @@ test("replaces an unsubscribed winner with the next subscribed candidate", async
   assert.deepEqual(store.getWinners(giveaway.id), [917]);
   assert.match(
     bot.messages.find(({ chatId }) => chatId === 900).text,
-    /Исключено неподписанных: 1/,
+    /Исключено за невыполнение условий: 1/,
   );
   assert.ok(bot.messages.some(({ chatId, text }) => (
     chatId === giveaway.publish_channel && /сохраняйте подписку/.test(text)
@@ -671,7 +808,7 @@ test("lets admins attach a photo or GIF and publishes it with the giveaway card"
     const activeGiveawayCount = store.getActiveGiveaways().length;
     const startCtx = createAdminMessage("/newgiveaway");
     await bot.commands.get("newgiveaway")(startCtx);
-    assert.match(startCtx.lastReply.text, /Шаг 1 из 9/);
+    assert.match(startCtx.lastReply.text, /Шаг 1 из 10/);
     for (const text of ["Розыгрыш с медиа", "Подарок", "Описание"]) {
       await textHandler(createAdminMessage(text));
     }
@@ -679,7 +816,7 @@ test("lets admins attach a photo or GIF and publishes it with the giveaway card"
       ...createAdminMessage(undefined),
       message: media,
     });
-    for (const text of ["0", "@makeiew", "-"]) {
+    for (const text of ["0", "@makeiew", "-", type === "photo" ? "да" : "нет"]) {
       await textHandler(createAdminMessage(text));
     }
     const winnerCountCtx = createAdminMessage("1");
@@ -703,6 +840,7 @@ test("lets admins attach a photo or GIF and publishes it with the giveaway card"
       type === "photo" ? 10 * 60 * 1000 : 60 * 60 * 1000,
     );
     assert.equal(giveaway.media_type, type);
+    assert.equal(giveaway.require_reaction, type === "photo" ? 1 : 0);
     assert.equal(
       giveaway.media_file_id,
       type === "photo" ? "photo-file-id" : "animation-file-id",
@@ -715,6 +853,7 @@ test("lets admins attach a photo or GIF and publishes it with the giveaway card"
   assert.equal(mediaPosts[0].type, "photo");
   assert.equal(mediaPosts[0].fileId, "photo-file-id");
   assert.match(mediaPosts[0].extra.caption, /ПОДАРКИ ОТ MAKEIEW/);
+  assert.match(mediaPosts[0].extra.caption, /поставьте любую реакцию/i);
   assert.equal(mediaPosts[1].type, "animation");
   assert.equal(mediaPosts[1].fileId, "animation-file-id");
   assert.ok(mediaPosts[1].extra.reply_markup.inline_keyboard[0][0].url.includes(`join_${giveaways[1].id}`));

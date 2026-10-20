@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0e10">
+  <title>Панель управления · Подарки от makeiew</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+  <!--
+  THESIS: A working console for verified giveaway operations, refusing the decorative map and generic metric-card dashboard.
+  OWN-WORLD: Graphite surfaces, hairline separators, compact system typography, measured monospace data, and color reserved for operational states.
+  STORY: The administrator sees active giveaways, money, participants, and the latest real events, then moves directly to the relevant record.
+  FIRST VIEWPORT: A fixed navigation rail frames a selected-giveaway workspace; operational totals sit above it and the event log stays in view beside it.
+  FORM: Operate mode; user-selected Dark Admin Console direction, built as a responsive desktop-first operations workspace. The pinned direction needs no concept-seed roll.
+  -->
+  <div id="login-screen" class="login-screen" hidden>
+    <main class="login-panel">
+      <div class="login-console-bar"><span class="brand-symbol">✳</span><span>MAKEIEW <i>/</i> ADMIN CONSOLE</span><span class="console-live"><span></span> SECURE</span></div>
+      <div class="brand-mark">TELEGRAM AUTHENTICATION</div>
+      <h1>Вход в панель</h1>
+      <p>Панель доступна только администраторам. Нажмите кнопку — бот отправит одноразовый код в ваш личный чат Telegram.</p>
+      <button class="button button-primary" id="login-button">Получить код в Telegram</button>
+      <form id="login-code-form" hidden>
+        <label class="login-code-label" for="login-code">Код из Telegram</label>
+        <input id="login-code" class="login-code-input" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required>
+        <button class="button button-primary" id="login-verify-button" type="submit">Войти в панель</button>
+      </form>
+      <p class="login-status" id="login-status" role="status"></p>
+    </main>
+  </div>
+
+  <div id="dashboard" class="app-shell" hidden>
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        <span class="brand-symbol">✳</span>
+        <span><strong>makeiew</strong><small>GIVEAWAY CONSOLE</small></span>
+      </div>
+      <nav class="nav-list" aria-label="Разделы панели">
+        <span class="nav-caption" data-i18n="navWorkspace">WORKSPACE</span>
+        <button class="nav-item is-active" data-view="overview"><span class="nav-glyph">◫</span><span data-i18n="overview">Обзор</span><span class="nav-count" id="active-count">—</span></button>
+        <button class="nav-item" data-view="analytics"><span class="nav-glyph">⌁</span><span data-i18n="analytics">Аналитика</span></button>
+        <button class="nav-item" data-view="participants"><span class="nav-glyph">◎</span><span data-i18n="participants">Участники</span></button>
+        <button class="nav-item" data-view="referrals"><span class="nav-glyph">↗</span><span data-i18n="referrals">Рефералы</span></button>
+        <span class="nav-caption nav-caption-spaced" data-i18n="navReview">REVIEW & FINANCE</span>
+        <button class="nav-item" data-view="payments"><span class="nav-glyph">◈</span><span data-i18n="finance">Финансы</span></button>
+        <button class="nav-item" data-view="risk"><span class="nav-glyph">!</span><span data-i18n="antifraud">Антифрод</span></button>
+        <button class="nav-item" data-view="blacklist"><span class="nav-glyph">⊘</span><span data-i18n="blacklist">Чёрный список</span></button>
+        <button class="nav-item" data-view="winners"><span class="nav-glyph">✳</span><span data-i18n="winners">Итоги</span></button>
+        <span class="nav-caption nav-caption-spaced" data-i18n="navSystem">SYSTEM</span>
+        <button class="nav-item" data-view="system"><span class="nav-glyph">⌘</span><span data-i18n="system">Система</span></button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="status-pin"></span><span id="bot-status" data-i18n="panelStatus">Панель активна</span>
+        <button class="text-button" id="logout-button" data-i18n="logout">Выйти</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <button class="mobile-menu" id="menu-button" aria-label="Открыть меню" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <div class="breadcrumbs"><span data-i18n="breadcrumb">CONSOLE</span><span> / </span><strong id="view-crumb">OVERVIEW</strong></div>
+        <div class="top-actions">
+          <span class="today-date" id="today-date"></span>
+          <button class="language-switch" id="language-button" aria-label="Change language">EN</button>
+          <span class="admin-chip"><span class="admin-avatar">A</span><span class="admin-id-label"><span data-i18n="adminLabel">ADMIN</span> <b id="admin-id">—</b></span></span>
+        </div>
+      </header>
+      <div id="view-content" class="view-content" aria-live="polite"></div>
+      <footer class="workspace-footer"><span>MAKEIEW / GIVEAWAY CONSOLE</span><span data-i18n="dataFooter">Показаны только сохранённые и проверяемые данные</span></footer>
+    </main>
+    <div class="toast" id="toast" role="status"></div>
+  </div>
+</body>
+</html>
